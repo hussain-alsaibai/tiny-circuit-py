@@ -16,10 +16,11 @@ class CircuitOpenError(Exception):
 class CircuitBreaker:
     def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0,
                  half_open_max_calls: int = 3, name: str = "default",
-                 expected_exceptions: tuple = (Exception,)):
+                 expected_exceptions: tuple = (Exception,), success_threshold: int = 1):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.half_open_max_calls = half_open_max_calls
+        self.success_threshold = success_threshold
         self.name = name
         self.expected_exceptions = expected_exceptions
         self._state = CircuitState.CLOSED
@@ -27,6 +28,7 @@ class CircuitBreaker:
         self._failure_count = 0; self._success_count = 0; self._total_calls = 0
         self._last_failure_time = None; self._last_success_time = None
         self._opened_at = None; self._half_open_calls = 0
+        self._half_open_successes = 0
         self._failure_timestamps: list[float] = []
 
     def get_state(self) -> str:
@@ -46,6 +48,7 @@ class CircuitBreaker:
             self._failure_timestamps = []
         elif new_state == CircuitState.HALF_OPEN:
             self._half_open_calls = 0
+            self._half_open_successes = 0
         elif new_state == CircuitState.CLOSED:
             self._failure_count = 0
             self._failure_timestamps = []; self._opened_at = None
@@ -67,8 +70,10 @@ class CircuitBreaker:
         with self._lock:
             self._success_count += 1; self._total_calls += 1
             self._last_success_time = time.time()
-            if self._state == CircuitState.HALF_OPEN and self._half_open_calls >= self.half_open_max_calls:
-                self._transition_to(CircuitState.CLOSED)
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_successes += 1
+                if self._half_open_successes >= self.success_threshold:
+                    self._transition_to(CircuitState.CLOSED)
 
     def record_failure(self) -> None:
         with self._lock:
@@ -111,6 +116,7 @@ class CircuitBreaker:
                 "last_failure": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_failure_time)) if self._last_failure_time else None,
                 "last_success": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_success_time)) if self._last_success_time else None,
                 "failure_threshold": self.failure_threshold,
+                "success_threshold": self.success_threshold,
                 "recovery_timeout": self.recovery_timeout,
             }
 
@@ -119,5 +125,6 @@ class CircuitBreaker:
             self._transition_to(CircuitState.CLOSED)
             self._failure_count = 0; self._success_count = 0; self._total_calls = 0
             self._failure_timestamps = []; self._opened_at = None; self._half_open_calls = 0
+        self._half_open_successes = 0
 
     def __repr__(self) -> str: return f"<CircuitBreaker {self.name} state={self.get_state()}>"

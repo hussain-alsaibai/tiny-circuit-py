@@ -7,8 +7,8 @@ resilience.
 > hammering it. Fail fast, recover automatically, and surface the failure as a
 > structured error your agent can reason about.
 
-`tiny-circuit` is ~250 lines of plain Python, runs anywhere Python 3.8+ runs, has no
-runtime dependencies, and ships with 25+ tests.
+`tiny-circuit-py` is ~130 lines of plain Python, runs anywhere Python 3.8+ runs, has no
+runtime dependencies, and ships with 11 tests.
 
 ---
 
@@ -29,212 +29,197 @@ lets the downstream catch its breath, and probes for recovery automatically.
 ## State Machine
 
 ```
-                    ┌─────────────┐
-                    │   CLOSED    │  normal operation; calls flow through
-                    │ (failures:0)│
-                    └──────┬──────┘
-                           │
+                    +-------------+
+                    |   CLOSED    |  normal operation; calls flow through
+                    | (failures:0)|
+                    +------+------+
+                           |
                   N consecutive failures
-                           │
-                           ▼
-                    ┌─────────────┐
-        manual ───▶ │    OPEN     │  fail fast; rejects with CircuitOpenError
-         close      │ (rejecting) │
-                    └──────┬──────┘
-                           │
+                           |
+                           v
+                    +-------------+
+        manual -->  |    OPEN     |  fail fast; rejects with CircuitOpenError
+         close      | (rejecting) |
+                    +------+------+
+                           |
                     recoveryTimeout
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │  HALF_OPEN  │  allow ≤ halfOpenMax probe calls
-                    │  (probing)  │
-                    └──────┬──────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
+                           |
+                           v
+                    +-------------+
+                    |  HALF_OPEN  |  allow <= half_open_max_calls probe calls
+                    |  (probing)  |
+                    +------+------+
+                           |
+              +------------+------------+
+              |                         |
        K consecutive           any failure
          successes
-              │                         │
-              ▼                         ▼
-         CLOSED ◀─────────────── OPEN
+              |                         |
+              v                         v
+         CLOSED <--------------- OPEN
 ```
 
-- **CLOSED → OPEN** after `failureThreshold` consecutive failures
-- **OPEN → HALF_OPEN** after `recoveryTimeout` ms
-- **HALF_OPEN → CLOSED** after `successThreshold` consecutive successes
-- **HALF_OPEN → OPEN** on any single failure (no partial recovery)
+- **CLOSED -> OPEN** after `failure_threshold` consecutive failures
+- **OPEN -> HALF_OPEN** after `recovery_timeout` seconds
+- **HALF_OPEN -> CLOSED** after `success_threshold` consecutive probe successes
+- **HALF_OPEN -> OPEN** on any single failure (no partial recovery)
 
 ---
 
 ## Install
 
-```bash
-npm install tiny-circuit
-```
+``bash
+pip install tiny-circuit-py
+``
 
-(No deps — just Node ≥ 18.)
+(No deps — pure Python 3.8+, standard library only.)
 
 ---
 
 ## Usage
 
-### Basic — wrap any async function
+### Basic — wrap any function
 
-```javascript
-const { CircuitBreaker } = require('tiny-circuit');
+```python
+from circuit import CircuitBreaker, CircuitOpenError
 
-const cb = new CircuitBreaker({
-  failureThreshold: 5,     // open after 5 consecutive failures
-  recoveryTimeout: 30_000, // probe again after 30s
-  halfOpenMax: 3,          // up to 3 concurrent probes
-  timeout: 10_000,         // per-call timeout in ms
-  name: 'anthropic-api',   // label for logs/metrics
-});
+cb = CircuitBreaker(
+    failure_threshold=5,      # open after 5 consecutive failures
+    recovery_timeout=30.0,    # probe again after 30s
+    half_open_max_calls=3,    # up to 3 concurrent probes
+    success_threshold=2,      # 2 consecutive probe successes to close
+    name="anthropic-api",     # label for logs/metrics
+)
 
-const result = await cb.execute(async () => {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-    },
-    body: JSON.stringify({
-      model: 'claude-opus-4-1',
-      max_tokens: 256,
-      messages: [{ role: 'user', content: 'Hello' }],
-    }),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
-});
+@cb
+def call_api() -> str:
+    return "ok"
+
+try:
+    call_api()
+except CircuitOpenError as e:
+    print(e.retry_after)   # seconds until the next probe is allowed
 ```
 
-### Fail-fast on bad pricing data
+### Fail-fast on a bad pricing feed
 
-```javascript
-const pricingCB = new CircuitBreaker({ failureThreshold: 3 });
+```python
+pricing_cb = CircuitBreaker(failure_threshold=3)
 
-async function getQuote(symbol) {
-  return pricingCB.execute(async () => {
-    const r = await fetch(`https://api.example.com/quote/${symbol}`);
-    if (!r.ok) throw new Error(`quote http ${r.status}`);
-    return r.json();
-  });
-}
+@pricing_cb
+def get_quote(symbol: str) -> float:
+    return fetch_quote(symbol)
 
-// After 3 failures, the breaker is OPEN for ~30s. All concurrent calls
-// reject instantly with CircuitOpenError — no waiting on a dead endpoint.
+# After 3 failures the breaker is OPEN for ~30s. Every call rejects
+# instantly with CircuitOpenError — no waiting on a dead endpoint.
 ```
 
-### Selective tripping with `shouldTrip`
+### Selective tripping with `expected_exceptions`
 
-Don't count a 4xx (your bug) the same as a 5xx (their problem):
+Don't count a `ValueError` (your bug) the same as a `TimeoutError` (their problem):
 
-```javascript
-const cb = new CircuitBreaker({
-  failureThreshold: 5,
-  shouldTrip: (err) => {
-    // Only trip on 5xx-class errors.
-    const m = /http (\d{3})/.exec(err.message);
-    return !m || m[1].startsWith('5');
-  },
-});
+```python
+from circuit import CircuitBreaker
+
+cb = CircuitBreaker(
+    failure_threshold=5,
+    expected_exceptions=(TimeoutError, ConnectionError),
+)
 ```
 
-### Listen to lifecycle events
+Only the listed exception types trip the breaker. Anything else propagates
+without changing the circuit state.
 
-```javascript
-const cb = new CircuitBreaker({ failureThreshold: 3 });
+### Async functions
 
-cb.on('open',     () => log.warn('circuit OPEN — falling back to cached results'));
-cb.on('half-open', () => log.info('probing downstream'));
-cb.on('close',    () => log.info('downstream recovered'));
-cb.on('reject',   ({ err }) => metrics.increment('cb.rejects'));
-cb.on('failure',  ({ err }) => log.error({ err }, 'call failed'));
-cb.on('timeout',  () => log.warn('call timed out'));
+The decorator detects coroutine functions and returns an async wrapper:
+
+```python
+@cb
+async def call_api_async() -> str:
+    return "ok"
 ```
 
 ### Inspect metrics
 
-```javascript
-console.log(cb.metrics);
-// {
-//   fires: 142, successes: 130, failures: 9, rejects: 3, timeouts: 2,
-//   stateChanges: 4, openedAt: 1722343200000, closedAt: 1722343260000,
-//   lastFailureAt: 1722343259000, lastSuccessAt: 1722343260500, ...
-// }
-console.log(cb.state);       // 'CLOSED' | 'OPEN' | 'HALF_OPEN'
-console.log(cb.isAllowing()); // false while OPEN
+```python
+stats = cb.get_stats()
+# {
+#   "name": "anthropic-api", "state": "closed",
+#   "failures": 9, "successes": 130, "total_calls": 142,
+#   "recent_failures": 2,
+#   "last_failure": "2026-11-02T01:02:03Z",
+#   "last_success": "2026-11-02T01:02:09Z",
+#   "failure_threshold": 5, "success_threshold": 2,
+#   "recovery_timeout": 30.0,
+# }
+cb.get_state()        # "closed" | "open" | "half_open"
+cb.allow_request()    # (allowed: bool, retry_after: float)
 ```
 
 ### Manual override
 
-```javascript
-cb.open();   // trip immediately (e.g. before deploys / known-down windows)
-cb.close();  // reset (e.g. after a successful canary)
+```python
+cb.reset()            # force back to CLOSED and clear all counters
 ```
 
 ---
 
 ## API
 
-### `new CircuitBreaker(options)`
+### `CircuitBreaker(options)`
 
-| Option             | Default | Meaning                                                       |
-| ------------------ | ------- | ------------------------------------------------------------- |
-| `failureThreshold` | `5`     | consecutive failures before tripping OPEN                     |
-| `successThreshold` | `2`     | consecutive successes in HALF_OPEN before closing              |
-| `recoveryTimeout`  | `30000` | ms to wait in OPEN before probing HALF_OPEN                   |
-| `halfOpenMax`      | `3`     | max concurrent probe calls in HALF_OPEN                       |
-| `timeout`          | `0`     | per-call timeout (ms); `0` disables                           |
-| `shouldTrip`       | `null`  | `(err) => boolean` — selective error classification           |
-| `name`             | `'circuit'` | label for logs/metrics                                   |
+| Option               | Default | Meaning                                                       |
+| -------------------- | ------- | ------------------------------------------------------------- |
+| `failure_threshold`  | `5`     | consecutive failures before tripping OPEN                     |
+| `success_threshold`  | `1`     | consecutive probe successes in HALF_OPEN before closing        |
+| `recovery_timeout`   | `30.0`  | seconds to wait in OPEN before probing HALF_OPEN              |
+| `half_open_max_calls`| `3`     | max concurrent probe calls in HALF_OPEN                       |
+| `expected_exceptions`| `(Exception,)` | exception types that trip the breaker                |
+| `name`               | `"default"` | label for logs/metrics                                   |
 
-### `cb.execute(fn) → Promise<T>`
+### Methods
 
-Runs `fn()`. Rejects with the original error if it throws. Rejects with
-`CircuitOpenError` if the circuit is open.
+- `cb.get_state() -> str` — "closed", "open" or "half_open"
+- `cb.allow_request() -> (bool, float)` — whether a call may proceed, and seconds to wait
+- `cb.record_success()` / `cb.record_failure()` — manual bookkeeping
+- `cb.get_stats() -> dict` — JSON-serialisable metrics
+- `cb.reset()` — force CLOSED and clear all counters
 
-### Events
+### Exceptions
 
-`success`, `failure`, `reject`, `timeout`, `open`, `half-open`, `close`
+- `CircuitOpenError(name, retry_after)` — raised when the circuit rejects a call
 
-Use `cb.on(event, fn)` / `cb.off(event, fn)` / `cb.once(event, fn)`.
+---
 
-### Properties
+## Notes
 
-- `cb.state` — `'CLOSED' | 'OPEN' | 'HALF_OPEN'`
-- `cb.metrics` — counters + timestamps (see above)
-- `cb.options` — frozen option snapshot
-- `cb.isAllowing()` — `false` while OPEN
+- The failure window is a **sliding window** of `recovery_timeout * 2` seconds,
+  not an infinite counter — old failures age out.
+- `record_success()` only counts toward closing when the circuit is in
+  `HALF_OPEN`. A probe must be admitted via `allow_request()` to count, so
+  the number of admitted probes and the number of successes stay consistent.
 
 ---
 
 ## Comparison
 
-| Feature                | **tiny-circuit**    | [`opossum`](https://www.npmjs.com/package/opossum)         |
-| ---------------------- | ------------------- | ---------------------------------------------------------- |
-| Runtime dependencies   | **0**               | 4 (hoek, joi, …)                                           |
-| Install size           | ~6 KB               | ~250 KB                                                    |
-| Lines of source        | ~250                | ~1500                                                      |
-| Python 3.8+ test runner    | ✅ built-in `pytest` | external (mocha / jest)                              |
-| Concurrent probe cap   | ✅ `halfOpenMax`    | ✅ `volumeThreshold`                                      |
-| Per-call timeout       | ✅                  | ✅                                                         |
-| EventEmitter           | ✅ custom events    | ✅ EventEmitter                                            |
-| Fallback function      | ❌ (handle it yourself — trivial) | ✅                                          |
-| Bulkheading / semaphores | ❌              | ✅                                                         |
-| Rolling stats window   | ❌ (consecutive only) | ✅ rolling counts                                       |
-| Plugin hooks           | ❌                  | ✅ (firewall, metrics, …)                                  |
+| Feature                | **tiny-circuit-py**    | `opossum` (JS) | `pybreaker` (Python) |
+| ---------------------- | ---------------------- | ---------------------- | ---------------------- |
+| Runtime dependencies   | **0**                  | 4 (hoek, joi, ...)      | 0                     |
+| Thread-safe            | **yes**                | yes                    | yes                   |
+| Async-aware            | **yes**                | yes (promise)          | partial               |
+| Concurrent probe cap   | **yes**                | yes                    | yes                   |
+| Per-call timeout       | ❌                     | yes                    | yes                   |
+| Event callbacks        | ❌                     | yes                    | yes                   |
+| Fallback function      | ❌                     | yes                    | yes                   |
 
-**Pick `tiny-circuit` if** you want a tiny, auditable, dependency-free breaker
+**Pick `tiny-circuit-py` if** you want a tiny, auditable, dependency-free breaker
 that does the basics perfectly — ideal for embedding into AI agents and edge
 functions where install size and supply-chain surface matter.
-
-**Pick `opossum` if** you want fallbacks, bulkheading, rolling windows, and an
-ecosystem of plugins.
 
 ---
 
 ## License
 
-MIT © 2026 hussain-alsaibai
+MIT (c) 2026 hussain-alsaibai
